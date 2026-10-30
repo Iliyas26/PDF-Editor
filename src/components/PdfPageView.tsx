@@ -381,10 +381,10 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
         if (isEditing && activeTextEdit) {
           const fontCss =
             activeTextEdit.fontFamily === 'Times'
-              ? 'serif'
+              ? '"Times New Roman", Times, Georgia, serif'
               : activeTextEdit.fontFamily === 'Courier'
-              ? 'monospace'
-              : 'sans-serif';
+              ? '"Courier New", Courier, monospace'
+              : 'Helvetica, Arial, sans-serif';
 
           return (
             <div
@@ -592,10 +592,10 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
         if (existingEdit && (existingEdit.newText !== item.str || existingEdit.fontSize !== item.fontSize || existingEdit.width !== item.width)) {
           const fontCss =
             existingEdit.fontFamily === 'Times'
-              ? 'serif'
+              ? '"Times New Roman", Times, Georgia, serif'
               : existingEdit.fontFamily === 'Courier'
-              ? 'monospace'
-              : 'sans-serif';
+              ? '"Courier New", Courier, monospace'
+              : 'Helvetica, Arial, sans-serif';
 
           return (
             <div

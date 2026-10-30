@@ -69,7 +69,8 @@ export async function renderPage(
 }
 
 /**
- * Extracts text items from a page with their PDF bounding boxes
+ * Extracts text items from a page with their PDF bounding boxes,
+ * accurately detecting real font names and clustering multi-line blocks/cells.
  */
 export async function extractTextItems(
   doc: pdfjsLib.PDFDocumentProxy,
@@ -78,7 +79,14 @@ export async function extractTextItems(
   try {
     const page = await doc.getPage(pageIndex + 1);
     const textContent = await page.getTextContent();
-    const items: DetectedTextItem[] = [];
+    const rawItems: DetectedTextItem[] = [];
+
+    // Ensure commonObjs is populated with font dictionaries
+    try {
+      await page.getOperatorList();
+    } catch (opErr) {
+      // Non-fatal if operator list is already cached
+    }
 
     textContent.items.forEach((item: any, idx: number) => {
       if (!item.str || item.str.trim() === '') return;
@@ -92,9 +100,23 @@ export async function extractTextItems(
       const rawFontName = item.fontName || '';
       const style = textContent.styles ? (textContent.styles as any)[rawFontName] : null;
       const styleFamily = style?.fontFamily || '';
-      const combined = `${rawFontName} ${styleFamily}`.toLowerCase();
+
+      // Inspect font object from page.commonObjs if available
+      let fontObj: any = null;
+      try {
+        if ((page as any).commonObjs && (page as any).commonObjs.has(rawFontName)) {
+          fontObj = (page as any).commonObjs.get(rawFontName);
+        }
+      } catch (fErr) {
+        // fallback to style dictionary
+      }
+
+      const realFontName = fontObj?.name || fontObj?.loadedName || rawFontName;
+      const fallbackName = fontObj?.fallbackName || styleFamily;
+      const combined = `${realFontName} ${fallbackName} ${rawFontName}`.toLowerCase();
 
       const isBold =
+        Boolean(fontObj?.bold || fontObj?.black) ||
         combined.includes('bold') ||
         combined.includes('black') ||
         combined.includes('heavy') ||
@@ -102,18 +124,24 @@ export async function extractTextItems(
         combined.includes('_b');
 
       const isItalic =
+        Boolean(fontObj?.italic) ||
         combined.includes('italic') ||
         combined.includes('oblique');
 
       let fontFamily = 'Helvetica';
       if (
+        fallbackName === 'serif' ||
         combined.includes('times') ||
         combined.includes('serif') ||
         combined.includes('roman') ||
-        combined.includes('georgia')
+        combined.includes('georgia') ||
+        combined.includes('garamond') ||
+        combined.includes('cambria') ||
+        combined.includes('palatino')
       ) {
         fontFamily = 'Times';
       } else if (
+        fallbackName === 'monospace' ||
         combined.includes('courier') ||
         combined.includes('mono') ||
         combined.includes('consolas')
@@ -127,15 +155,15 @@ export async function extractTextItems(
       const width = item.width || item.str.length * fontSize * 0.55;
       const height = Math.max(fontSize * 1.2, item.height || fontSize);
 
-      items.push({
-        id: `text-${pageIndex}-${idx}`,
+      rawItems.push({
+        id: `raw-${pageIndex}-${idx}`,
         str: item.str,
         x,
         y,
         width,
         height,
         fontSize: Math.round(fontSize * 10) / 10,
-        fontName: rawFontName,
+        fontName: realFontName,
         fontFamily,
         isBold,
         isItalic,
@@ -143,11 +171,100 @@ export async function extractTextItems(
       });
     });
 
-    return items;
+    // Cluster raw text items into coherent paragraphs and multi-line table cells
+    return smartClusterText(rawItems, pageIndex);
   } catch (err) {
     console.error('Error extracting text items:', err);
     return [];
   }
+}
+
+/**
+ * Smartly clusters individual text fragments and multi-line table cells
+ * so that entire blocks are edited as a single coherent unit.
+ */
+function smartClusterText(rawItems: DetectedTextItem[], pageIndex: number): DetectedTextItem[] {
+  if (!rawItems || rawItems.length === 0) return [];
+
+  // Step 1: Sort by Y descending (top of page down), then X ascending (left to right)
+  const sorted = [...rawItems].sort((a, b) => b.y - a.y || a.x - b.x);
+
+  // Step 2: Merge words on the same horizontal line
+  const lineMerged: DetectedTextItem[] = [];
+  for (const item of sorted) {
+    let merged = false;
+    for (const prev of lineMerged) {
+      const sameLine = Math.abs(prev.y - item.y) < Math.min(prev.fontSize, item.fontSize) * 0.45;
+      const isNextWord =
+        item.x >= prev.x + prev.width - 2 &&
+        item.x - (prev.x + prev.width) < prev.fontSize * 1.8;
+
+      if (sameLine && isNextWord) {
+        const needsSpace = item.x - (prev.x + prev.width) > prev.fontSize * 0.15;
+        prev.str += (needsSpace ? ' ' : '') + item.str;
+        prev.width = item.x + item.width - prev.x;
+        prev.height = Math.max(prev.height, item.height);
+        prev.isBold = prev.isBold || item.isBold;
+        prev.isItalic = prev.isItalic || item.isItalic;
+        if (item.fontFamily !== 'Helvetica') {
+          prev.fontFamily = item.fontFamily;
+        }
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      lineMerged.push({ ...item });
+    }
+  }
+
+  // Step 3: Merge vertically adjacent lines that belong to the same cell/paragraph
+  const clusters: DetectedTextItem[] = [];
+  for (const item of lineMerged) {
+    let merged = false;
+    for (const cluster of clusters) {
+      const minX = Math.min(cluster.x, item.x);
+      const maxX = Math.max(cluster.x + cluster.width, item.x + item.width);
+      const xOverlap = Math.max(0, cluster.width + item.width - (maxX - minX));
+      const isXAligned =
+        Math.abs(cluster.x - item.x) < 25 ||
+        xOverlap > Math.min(cluster.width, item.width) * 0.35;
+
+      const verticalDist = cluster.y - item.y;
+      const isLineBelow = verticalDist > 0 && verticalDist < cluster.fontSize * 2.4;
+      const isSameFont = Math.abs(cluster.fontSize - item.fontSize) <= 3;
+
+      if (isXAligned && isLineBelow && isSameFont) {
+        cluster.str += '\n' + item.str;
+        const newX = Math.min(cluster.x, item.x);
+        const newY = Math.min(cluster.y, item.y);
+        const newMaxX = Math.max(cluster.x + cluster.width, item.x + item.width);
+        const newMaxY = Math.max(cluster.y + cluster.height, item.y + item.height);
+
+        cluster.x = newX;
+        cluster.y = newY;
+        cluster.width = newMaxX - newX;
+        cluster.height = newMaxY - newY;
+        cluster.fontSize = Math.min(cluster.fontSize, item.fontSize);
+        cluster.isBold = cluster.isBold || item.isBold;
+        cluster.isItalic = cluster.isItalic || item.isItalic;
+        if (item.fontFamily !== 'Helvetica') {
+          cluster.fontFamily = item.fontFamily;
+        }
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      clusters.push({ ...item });
+    }
+  }
+
+  // Assign stable IDs
+  return clusters.map((c, idx) => ({
+    ...c,
+    id: `text-${pageIndex}-${idx}`,
+  }));
 }
 
 /**

@@ -26,8 +26,17 @@ async function testPdfEngine() {
     color: rgb(1, 1, 1),
   });
 
-  // Re-stamp new text
-  copiedPage.drawText('Updated Price: $250', { x: 50, y: 400, size: 14, font: await outputDoc.embedFont(StandardFonts.Helvetica), color: rgb(0, 0.5, 0) });
+  // Re-stamp new text with multi-line and Times font
+  const timesFont = await outputDoc.embedFont(StandardFonts.TimesRomanBold);
+  copiedPage.drawText('Rs\n1799_90D\n/D', {
+    x: 50,
+    y: 350,
+    size: 11,
+    font: timesFont,
+    color: rgb(0, 0, 0),
+    lineHeight: 14,
+    maxWidth: 80,
+  });
 
   outputDoc.addPage(copiedPage);
 
