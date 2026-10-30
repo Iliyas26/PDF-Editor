@@ -9,7 +9,14 @@ import {
   DetectedTextItem
 } from '../types';
 import { renderPage, extractTextItems } from '../utils/pdfEngine';
-import { Trash2, Move, RotateCw, Check, X, Image as ImageIcon } from 'lucide-react';
+import {
+  Trash2,
+  Check,
+  Bold,
+  Italic,
+  Minus,
+  Plus
+} from 'lucide-react';
 
 interface PdfPageViewProps {
   doc: pdfjsLib.PDFDocumentProxy | null;
@@ -53,7 +60,7 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
 
   const [detectedTexts, setDetectedTexts] = useState<DetectedTextItem[]>([]);
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
-  const [editingValue, setEditingValue] = useState<string>('');
+  const [activeTextEdit, setActiveTextEdit] = useState<TextEditItem | null>(null);
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
 
   // Drawing state for shapes
@@ -70,12 +77,21 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     origY: number;
   } | null>(null);
 
+  // Resizing text box handles
+  const [resizingText, setResizingText] = useState<{
+    handle: 'right' | 'bottom' | 'corner';
+    startX: number;
+    startY: number;
+    origWidth: number;
+    origHeight: number;
+    origY: number;
+  } | null>(null);
+
   // Load and render page canvas
   useEffect(() => {
     let isCancelled = false;
     async function load() {
       if (page.source === 'blank') {
-        // Just clear canvas to pure white
         const canvas = canvasRef.current;
         if (canvas) {
           canvas.width = page.width * zoom;
@@ -107,17 +123,19 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
 
   // Handle click on canvas for adding text or shapes
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (editingTextId) return; // currently editing inline text
+    // If clicking outside active text box, commit it
+    if (activeTextEdit && editingTextId) {
+      commitActiveTextEdit();
+    }
 
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
-    // Relative coordinates in PDF points (unscaled by zoom)
     const clientX = e.clientX - rect.left;
     const clientY = e.clientY - rect.top;
 
     const pdfX = clientX / zoom;
-    const pdfY = (rect.height - clientY) / zoom; // PDF coordinates: bottom-up
+    const pdfY = (rect.height - clientY) / zoom;
 
     if (activeTool === 'addText') {
       const newElem: CustomElement = {
@@ -154,6 +172,36 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     const pdfX = clientX / zoom;
     const pdfY = (rect.height - clientY) / zoom;
 
+    // Handle Text Box Resizing
+    if (resizingText && activeTextEdit) {
+      const deltaX = (e.clientX - resizingText.startX) / zoom;
+      const deltaY = (e.clientY - resizingText.startY) / zoom;
+
+      let newWidth = activeTextEdit.width;
+      let newHeight = activeTextEdit.height;
+      let newY = activeTextEdit.y;
+
+      if (resizingText.handle === 'right' || resizingText.handle === 'corner') {
+        newWidth = Math.max(25, resizingText.origWidth + deltaX);
+      }
+      if (resizingText.handle === 'bottom' || resizingText.handle === 'corner') {
+        newHeight = Math.max(12, resizingText.origHeight + deltaY);
+        newY = resizingText.origY - deltaY;
+      }
+
+      setActiveTextEdit((prev) =>
+        prev
+          ? {
+              ...prev,
+              width: Math.round(newWidth * 10) / 10,
+              height: Math.round(newHeight * 10) / 10,
+              y: Math.round(newY * 10) / 10,
+            }
+          : null
+      );
+      return;
+    }
+
     // Handle Shape Drawing
     if (isDrawing && drawStart) {
       setCurrentDraw({
@@ -167,7 +215,7 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     // Handle Element Dragging
     if (draggedElement) {
       const deltaX = (e.clientX - draggedElement.startX) / zoom;
-      const deltaY = (draggedElement.startY - e.clientY) / zoom; // PDF Y is inverted
+      const deltaY = (draggedElement.startY - e.clientY) / zoom;
 
       const elem = customElements.find((el) => el.id === draggedElement.id);
       if (elem) {
@@ -181,6 +229,10 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
   };
 
   const handleMouseUp = () => {
+    if (resizingText) {
+      setResizingText(null);
+    }
+
     if (isDrawing && drawStart && currentDraw) {
       if (currentDraw.w > 5 || currentDraw.h > 5) {
         const elemType: 'rectangle' | 'line' | 'arrow' =
@@ -213,34 +265,61 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     }
   };
 
-  // Start inline text editing
+  // Start inline text editing with floating toolbar & resize controls
   const handleStartEditText = (item: DetectedTextItem, existingEdit?: TextEditItem) => {
     setEditingTextId(item.id);
-    setEditingValue(existingEdit ? existingEdit.newText : item.str);
-  };
 
-  // Commit inline text editing
-  const handleFinishEditText = (item: DetectedTextItem) => {
-    if (editingTextId !== item.id) return;
-
-    if (editingValue !== item.str) {
-      onRecordHistory();
-      const updatedEdit: TextEditItem = {
+    if (existingEdit) {
+      setActiveTextEdit({ ...existingEdit });
+    } else {
+      setActiveTextEdit({
         id: `edit-${item.id}`,
         pageId: page.id,
         originalText: item.str,
-        newText: editingValue,
+        newText: item.str,
         x: item.x,
         y: item.y,
-        width: Math.max(item.width, editingValue.length * item.fontSize * 0.6),
+        width: item.width,
         height: item.height,
         fontSize: item.fontSize,
-        fontFamily: item.fontName,
+        fontFamily: item.fontFamily,
+        isBold: item.isBold,
+        isItalic: item.isItalic,
         color: { r: 0.1, g: 0.1, b: 0.1 },
-      };
-      onUpdateTextEdit(updatedEdit);
+      });
     }
+  };
+
+  // Commit text editing changes
+  const commitActiveTextEdit = () => {
+    if (!activeTextEdit) return;
+
+    if (
+      activeTextEdit.newText !== activeTextEdit.originalText ||
+      activeTextEdit.isDeleted ||
+      activeTextEdit.isBold ||
+      activeTextEdit.isItalic ||
+      activeTextEdit.fontSize
+    ) {
+      onRecordHistory();
+      onUpdateTextEdit(activeTextEdit);
+    }
+
     setEditingTextId(null);
+    setActiveTextEdit(null);
+  };
+
+  // Delete / Whiteout selected text box
+  const handleDeleteText = () => {
+    if (!activeTextEdit) return;
+    onRecordHistory();
+    onUpdateTextEdit({
+      ...activeTextEdit,
+      isDeleted: true,
+      newText: '',
+    });
+    setEditingTextId(null);
+    setActiveTextEdit(null);
   };
 
   return (
@@ -261,88 +340,268 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
         className="absolute top-0 left-0 w-full h-full pointer-events-none"
       />
 
-      {/* 2. Detected PDF Text Layer (for Click-to-Edit Inline) */}
+      {/* 2. Detected PDF Text Layer */}
       {detectedTexts.map((item) => {
         const existingEdit = textEdits.find(
-          (t) => t.pageId === page.id && t.x === item.x && t.y === item.y
+          (t) => t.pageId === page.id && t.id === `edit-${item.id}`
         );
 
-        const displayText = existingEdit ? existingEdit.newText : item.str;
+        const currentEdit = editingTextId === item.id ? activeTextEdit : existingEdit;
         const isEditing = editingTextId === item.id;
-        const isDeleted = existingEdit?.isDeleted;
+        const isDeleted = currentEdit?.isDeleted;
 
-        // Convert PDF coordinates to DOM top/left percentages
-        const left = (item.x / page.width) * 100;
-        const top = ((page.height - item.y - item.height) / page.height) * 100;
-        const width = (Math.max(item.width, (displayText?.length || 1) * item.fontSize * 0.55) / page.width) * 100;
-        const height = (item.height / page.height) * 100;
+        // Current coordinates (uses edited box dimensions if adjusted)
+        const curX = currentEdit ? currentEdit.x : item.x;
+        const curY = currentEdit ? currentEdit.y : item.y;
+        const curW = currentEdit ? currentEdit.width : item.width;
+        const curH = currentEdit ? currentEdit.height : item.height;
+
+        const left = (curX / page.width) * 100;
+        const top = ((page.height - curY - curH) / page.height) * 100;
+        const width = (curW / page.width) * 100;
+        const height = (curH / page.height) * 100;
 
         if (isDeleted) {
           return (
             <div
               key={item.id}
-              className="absolute bg-white z-10"
+              className="absolute bg-white z-10 border border-transparent hover:border-red-300"
               style={{
                 left: `${left}%`,
                 top: `${top}%`,
                 width: `${width}%`,
                 height: `${height}%`,
               }}
+              title="Deleted / Whiteout text area"
             />
           );
         }
 
-        // Active inline editing input
-        if (isEditing) {
+        // Active inline editing with floating toolbar & resize handles
+        if (isEditing && activeTextEdit) {
+          const fontCss =
+            activeTextEdit.fontFamily === 'Times'
+              ? 'serif'
+              : activeTextEdit.fontFamily === 'Courier'
+              ? 'monospace'
+              : 'sans-serif';
+
           return (
             <div
               key={item.id}
-              className="absolute z-30 flex items-center bg-white shadow-lg border-2 border-indigo-500 rounded px-1"
+              className="absolute z-30 flex flex-col items-start bg-white shadow-xl ring-2 ring-indigo-500 rounded-sm"
               style={{
                 left: `${left}%`,
                 top: `${top}%`,
-                minWidth: `${width}%`,
-                height: `${Math.max(height * (page.height * zoom / 100), 24)}px`,
+                width: `${width}%`,
+                minHeight: `${height}%`,
               }}
               onClick={(e) => e.stopPropagation()}
             >
-              <input
+              {/* Floating Toolbar above the text box */}
+              <div
+                className="absolute -top-10 left-0 flex items-center space-x-1 bg-slate-900 text-white px-2 py-1 rounded-lg shadow-xl text-xs z-40 whitespace-nowrap"
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                {/* Font Family selector */}
+                <select
+                  value={activeTextEdit.fontFamily}
+                  onChange={(e) =>
+                    setActiveTextEdit({ ...activeTextEdit, fontFamily: e.target.value })
+                  }
+                  className="bg-slate-800 text-slate-100 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] focus:outline-none"
+                >
+                  <option value="Helvetica">Sans (Helvetica)</option>
+                  <option value="Times">Serif (Times)</option>
+                  <option value="Courier">Mono (Courier)</option>
+                </select>
+
+                <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                {/* Font Size decrease */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActiveTextEdit({
+                      ...activeTextEdit,
+                      fontSize: Math.max(6, activeTextEdit.fontSize - 1),
+                    })
+                  }
+                  className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
+                  title="Decrease Font Size"
+                >
+                  <Minus className="w-3 h-3" />
+                </button>
+
+                <span className="font-mono text-[11px] px-1 text-slate-200">
+                  {activeTextEdit.fontSize}pt
+                </span>
+
+                {/* Font Size increase */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActiveTextEdit({
+                      ...activeTextEdit,
+                      fontSize: Math.min(72, activeTextEdit.fontSize + 1),
+                    })
+                  }
+                  className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
+                  title="Increase Font Size"
+                >
+                  <Plus className="w-3 h-3" />
+                </button>
+
+                <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                {/* Bold toggle */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActiveTextEdit({ ...activeTextEdit, isBold: !activeTextEdit.isBold })
+                  }
+                  className={`p-1 rounded ${
+                    activeTextEdit.isBold
+                      ? 'bg-indigo-600 text-white font-bold'
+                      : 'hover:bg-slate-800 text-slate-300'
+                  }`}
+                  title="Toggle Bold"
+                >
+                  <Bold className="w-3 h-3" />
+                </button>
+
+                {/* Italic toggle */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActiveTextEdit({ ...activeTextEdit, isItalic: !activeTextEdit.isItalic })
+                  }
+                  className={`p-1 rounded ${
+                    activeTextEdit.isItalic
+                      ? 'bg-indigo-600 text-white'
+                      : 'hover:bg-slate-800 text-slate-300'
+                  }`}
+                  title="Toggle Italic"
+                >
+                  <Italic className="w-3 h-3" />
+                </button>
+
+                <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                {/* Delete / Whiteout */}
+                <button
+                  type="button"
+                  onClick={handleDeleteText}
+                  className="p-1 hover:bg-red-600 text-red-400 hover:text-white rounded transition-colors"
+                  title="Delete Text & Mask Whiteout"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+
+                {/* Save / Done button */}
+                <button
+                  type="button"
+                  onClick={commitActiveTextEdit}
+                  className="p-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded transition-colors"
+                  title="Save Edit"
+                >
+                  <Check className="w-3 h-3" />
+                </button>
+              </div>
+
+              {/* Multi-line Text Area wrapping inside the box */}
+              <textarea
                 autoFocus
-                type="text"
-                value={editingValue}
-                onChange={(e) => setEditingValue(e.target.value)}
+                value={activeTextEdit.newText}
+                onChange={(e) =>
+                  setActiveTextEdit({ ...activeTextEdit, newText: e.target.value })
+                }
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleFinishEditText(item);
-                  if (e.key === 'Escape') setEditingTextId(null);
+                  if (e.key === 'Escape') {
+                    setEditingTextId(null);
+                    setActiveTextEdit(null);
+                  }
                 }}
-                onBlur={() => handleFinishEditText(item)}
-                className="w-full bg-transparent outline-none text-slate-900 font-sans"
+                className="w-full h-full bg-white text-slate-900 border-none outline-none p-0.5 resize-none overflow-hidden"
                 style={{
-                  fontSize: `${item.fontSize * zoom}px`,
-                  lineHeight: 1,
+                  fontSize: `${activeTextEdit.fontSize * zoom}px`,
+                  fontFamily: fontCss,
+                  fontWeight: activeTextEdit.isBold ? 'bold' : 'normal',
+                  fontStyle: activeTextEdit.isItalic ? 'italic' : 'normal',
+                  lineHeight: 1.25,
+                  wordBreak: 'break-word',
+                  whiteSpace: 'pre-wrap',
                 }}
               />
-              <button
+
+              {/* Resize Handle: Right (Width) */}
+              <div
                 onMouseDown={(e) => {
-                  e.preventDefault();
-                  handleFinishEditText(item);
+                  e.stopPropagation();
+                  setResizingText({
+                    handle: 'right',
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    origWidth: activeTextEdit.width,
+                    origHeight: activeTextEdit.height,
+                    origY: activeTextEdit.y,
+                  });
                 }}
-                className="p-0.5 text-indigo-600 hover:text-indigo-800"
-                title="Save Edit (Enter)"
-              >
-                <Check className="w-3.5 h-3.5" />
-              </button>
+                className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-3 h-5 bg-indigo-600 border border-white rounded-xs cursor-ew-resize shadow-xs"
+                title="Drag to resize box width"
+              />
+
+              {/* Resize Handle: Bottom (Height) */}
+              <div
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  setResizingText({
+                    handle: 'bottom',
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    origWidth: activeTextEdit.width,
+                    origHeight: activeTextEdit.height,
+                    origY: activeTextEdit.y,
+                  });
+                }}
+                className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 h-3 w-5 bg-indigo-600 border border-white rounded-xs cursor-ns-resize shadow-xs"
+                title="Drag to resize box height"
+              />
+
+              {/* Resize Handle: Bottom-Right Corner (Width & Height) */}
+              <div
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  setResizingText({
+                    handle: 'corner',
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    origWidth: activeTextEdit.width,
+                    origHeight: activeTextEdit.height,
+                    origY: activeTextEdit.y,
+                  });
+                }}
+                className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 bg-indigo-600 border border-white rounded-xs cursor-nwse-resize shadow-xs"
+                title="Drag corner to resize box"
+              />
             </div>
           );
         }
 
-        // If previously edited, mask original on canvas and render updated text
-        if (existingEdit && existingEdit.newText !== item.str) {
+        // If previously edited, mask original on canvas and render updated text wrapped in box
+        if (existingEdit && (existingEdit.newText !== item.str || existingEdit.fontSize !== item.fontSize || existingEdit.width !== item.width)) {
+          const fontCss =
+            existingEdit.fontFamily === 'Times'
+              ? 'serif'
+              : existingEdit.fontFamily === 'Courier'
+              ? 'monospace'
+              : 'sans-serif';
+
           return (
             <div
               key={item.id}
               onClick={() => activeTool === 'editText' && handleStartEditText(item, existingEdit)}
-              className={`absolute z-10 bg-white flex items-center cursor-text transition-all ${
+              className={`absolute z-10 bg-white flex flex-col justify-start cursor-pointer transition-all ${
                 activeTool === 'editText'
                   ? 'hover:ring-1 hover:ring-indigo-400 hover:bg-indigo-50/20'
                   : ''
@@ -352,12 +611,19 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
                 top: `${top}%`,
                 width: `${width}%`,
                 height: `${height}%`,
-                fontSize: `${item.fontSize * zoom}px`,
+                fontSize: `${existingEdit.fontSize * zoom}px`,
+                fontFamily: fontCss,
+                fontWeight: existingEdit.isBold ? 'bold' : 'normal',
+                fontStyle: existingEdit.isItalic ? 'italic' : 'normal',
                 color: '#1a1a1a',
-                lineHeight: 1,
+                lineHeight: 1.25,
+                overflow: 'hidden',
+                wordBreak: 'break-word',
+                whiteSpace: 'pre-wrap',
               }}
+              title="Click to edit or adjust box size"
             >
-              <span className="truncate w-full">{existingEdit.newText}</span>
+              {existingEdit.newText}
             </div>
           );
         }

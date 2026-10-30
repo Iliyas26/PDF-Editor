@@ -121,25 +121,31 @@ export async function exportModifiedPdf(params: {
       // Precision vector mask over original text area
       targetPage.drawRectangle({
         x: edit.x - 1,
-        y: edit.y - 2,
-        width: edit.width + 4,
-        height: edit.height + 4,
+        y: edit.y - 1,
+        width: edit.width + 2,
+        height: edit.height + 2,
         color: rgb(1, 1, 1), // Clean white background mask
       });
 
       // Re-stamp new text if not deleted and not empty
       if (!edit.isDeleted && edit.newText && edit.newText.trim().length > 0) {
-        const isBold = edit.fontFamily.toLowerCase().includes('bold');
-        const isItalic = edit.fontFamily.toLowerCase().includes('italic') || edit.fontFamily.toLowerCase().includes('oblique');
+        const isBold = edit.isBold ?? edit.fontFamily.toLowerCase().includes('bold');
+        const isItalic =
+          edit.isItalic ??
+          (edit.fontFamily.toLowerCase().includes('italic') ||
+            edit.fontFamily.toLowerCase().includes('oblique'));
         const fontEnum = resolveStandardFont(edit.fontFamily, isBold, isItalic);
         const font = await getFont(fontEnum);
 
+        // Position text baseline at top of box minus font ascent, wrap inside box width
         targetPage.drawText(edit.newText, {
           x: edit.x,
-          y: edit.y,
+          y: edit.y + edit.height - edit.fontSize * 0.85,
           size: edit.fontSize,
           font,
           color: rgb(edit.color.r, edit.color.g, edit.color.b),
+          maxWidth: edit.width,
+          lineHeight: edit.fontSize * 1.25,
         });
       }
     }

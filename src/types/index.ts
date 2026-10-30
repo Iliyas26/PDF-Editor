@@ -19,6 +19,8 @@ export interface TextEditItem {
   height: number; // PDF points
   fontSize: number;
   fontFamily: string;
+  isBold?: boolean;
+  isItalic?: boolean;
   color: { r: number; g: number; b: number };
   isDeleted?: boolean;
 }
@@ -66,6 +68,9 @@ export interface DetectedTextItem {
   height: number;
   fontSize: number;
   fontName: string;
+  fontFamily: string;
+  isBold: boolean;
+  isItalic: boolean;
   transform: number[];
 }
 

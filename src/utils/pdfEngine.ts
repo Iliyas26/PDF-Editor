@@ -78,8 +78,6 @@ export async function extractTextItems(
   try {
     const page = await doc.getPage(pageIndex + 1);
     const textContent = await page.getTextContent();
-    const viewport = page.getViewport({ scale: 1, rotation: 0 }); // unrotated 1.0 scale
-
     const items: DetectedTextItem[] = [];
 
     textContent.items.forEach((item: any, idx: number) => {
@@ -91,11 +89,43 @@ export async function extractTextItems(
       const scaleY = item.transform[3];
       const fontSize = Math.sqrt(scaleX * scaleX + scaleY * scaleY) || item.height || 12;
 
-      // In PDF coordinates: (0,0) is bottom-left
+      const rawFontName = item.fontName || '';
+      const style = textContent.styles ? (textContent.styles as any)[rawFontName] : null;
+      const styleFamily = style?.fontFamily || '';
+      const combined = `${rawFontName} ${styleFamily}`.toLowerCase();
+
+      const isBold =
+        combined.includes('bold') ||
+        combined.includes('black') ||
+        combined.includes('heavy') ||
+        combined.includes('-b') ||
+        combined.includes('_b');
+
+      const isItalic =
+        combined.includes('italic') ||
+        combined.includes('oblique');
+
+      let fontFamily = 'Helvetica';
+      if (
+        combined.includes('times') ||
+        combined.includes('serif') ||
+        combined.includes('roman') ||
+        combined.includes('georgia')
+      ) {
+        fontFamily = 'Times';
+      } else if (
+        combined.includes('courier') ||
+        combined.includes('mono') ||
+        combined.includes('consolas')
+      ) {
+        fontFamily = 'Courier';
+      }
+
+      // PDF coordinates: bounding box bottom edge is baseline minus descent (approx 20% of fontSize)
       const x = tx;
-      const y = ty;
-      const width = item.width || (item.str.length * fontSize * 0.55);
-      const height = item.height || fontSize;
+      const y = ty - fontSize * 0.2;
+      const width = item.width || item.str.length * fontSize * 0.55;
+      const height = Math.max(fontSize * 1.2, item.height || fontSize);
 
       items.push({
         id: `text-${pageIndex}-${idx}`,
@@ -105,7 +135,10 @@ export async function extractTextItems(
         width,
         height,
         fontSize: Math.round(fontSize * 10) / 10,
-        fontName: item.fontName || 'Helvetica',
+        fontName: rawFontName,
+        fontFamily,
+        isBold,
+        isItalic,
         transform: item.transform,
       });
     });
