@@ -38,6 +38,7 @@ export function App() {
   const [pages, setPages] = useState<PageDescriptor[]>([]);
   const [currentPageIndex, setCurrentPageIndex] = useState<number>(0);
   const [importedDocs, setImportedDocs] = useState<Map<string, ImportedDocument>>(new Map());
+  const [importedPdfDocs, setImportedPdfDocs] = useState<Map<string, pdfjsLib.PDFDocumentProxy>>(new Map());
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
 
@@ -131,6 +132,7 @@ export function App() {
       setUndoStack([]);
       setRedoStack([]);
       setImportedDocs(new Map());
+      setImportedPdfDocs(new Map());
     } catch (err) {
       console.error('Failed to open PDF:', err);
       alert('Unable to load this PDF. Please check the file format.');
@@ -158,6 +160,7 @@ export function App() {
       setUndoStack([]);
       setRedoStack([]);
       setImportedDocs(new Map());
+      setImportedPdfDocs(new Map());
     } catch (err) {
       console.error('Failed to generate sample PDF:', err);
     } finally {
@@ -178,6 +181,8 @@ export function App() {
     setTextEdits([]);
     setImageEdits([]);
     setCustomElements([]);
+    setImportedDocs(new Map());
+    setImportedPdfDocs(new Map());
   };
 
   // Export modified PDF
@@ -269,6 +274,12 @@ export function App() {
       setImportedDocs((prev) => {
         const next = new Map(prev);
         next.set(docKey, { id: docKey, name: file.name, bytes });
+        return next;
+      });
+
+      setImportedPdfDocs((prev) => {
+        const next = new Map(prev);
+        next.set(docKey, doc);
         return next;
       });
 
@@ -448,7 +459,9 @@ export function App() {
             <main className="flex-1 overflow-auto p-8 flex items-center justify-center bg-slate-200/70 dark:bg-slate-950/90 relative">
               {pages[currentPageIndex] && (
                 <PdfPageView
-                  doc={pdfDoc}
+                  doc={pages[currentPageIndex].source === 'imported' && pages[currentPageIndex].importedDocKey
+                    ? (importedPdfDocs.get(pages[currentPageIndex].importedDocKey!) ?? pdfDoc)
+                    : pdfDoc}
                   page={pages[currentPageIndex]}
                   pageIndex={currentPageIndex}
                   zoom={zoom}

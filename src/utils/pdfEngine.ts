@@ -10,7 +10,8 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs
  */
 export async function loadPdf(data: Uint8Array): Promise<pdfjsLib.PDFDocumentProxy> {
   const loadingTask = pdfjsLib.getDocument({
-    data,
+    // PDF.js transfers its input buffer to the worker; keep the caller's bytes for export.
+    data: data.slice(),
     cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/cmaps/`,
     cMapPacked: true,
   });
@@ -101,11 +102,13 @@ export async function extractTextItems(
       const style = textContent.styles ? (textContent.styles as any)[rawFontName] : null;
       const styleFamily = style?.fontFamily || '';
 
-      // Inspect font object from page.commonObjs if available
+      // Inspect font object from page.commonObjs or page.objs if available
       let fontObj: any = null;
       try {
         if ((page as any).commonObjs && (page as any).commonObjs.has(rawFontName)) {
           fontObj = (page as any).commonObjs.get(rawFontName);
+        } else if ((page as any).objs && (page as any).objs.has(rawFontName)) {
+          fontObj = (page as any).objs.get(rawFontName);
         }
       } catch (fErr) {
         // fallback to style dictionary
@@ -120,38 +123,24 @@ export async function extractTextItems(
         combined.includes('bold') ||
         combined.includes('black') ||
         combined.includes('heavy') ||
+        combined.includes('semibold') ||
+        combined.includes('demi') ||
+        combined.includes('medium') ||
         combined.includes('-b') ||
         combined.includes('_b');
 
       const isItalic =
         Boolean(fontObj?.italic) ||
         combined.includes('italic') ||
-        combined.includes('oblique');
+        combined.includes('oblique') ||
+        combined.includes('-i') ||
+        combined.includes('_i');
 
-      let fontFamily = 'Helvetica';
-      if (
-        fallbackName === 'serif' ||
-        combined.includes('times') ||
-        combined.includes('serif') ||
-        combined.includes('roman') ||
-        combined.includes('georgia') ||
-        combined.includes('garamond') ||
-        combined.includes('cambria') ||
-        combined.includes('palatino')
-      ) {
-        fontFamily = 'Times';
-      } else if (
-        fallbackName === 'monospace' ||
-        combined.includes('courier') ||
-        combined.includes('mono') ||
-        combined.includes('consolas')
-      ) {
-        fontFamily = 'Courier';
-      }
+      const fontFamily = cleanFontFamily(realFontName, fallbackName);
 
       // PDF coordinates: bounding box bottom edge is baseline minus descent (approx 20% of fontSize)
       const x = tx;
-      const y = ty - fontSize * 0.2;
+      const y = ty - fontSize * 0.22;
       const width = item.width || item.str.length * fontSize * 0.55;
       const height = Math.max(fontSize * 1.2, item.height || fontSize);
 
@@ -162,6 +151,7 @@ export async function extractTextItems(
         y,
         width,
         height,
+        origBoxes: [{ x, y, width, height }],
         fontSize: Math.round(fontSize * 10) / 10,
         fontName: realFontName,
         fontFamily,
@@ -171,8 +161,8 @@ export async function extractTextItems(
       });
     });
 
-    // Cluster raw text items into coherent paragraphs and multi-line table cells
-    return smartClusterText(rawItems, pageIndex);
+    // Cluster text items into coherent paragraphs and multi-line sections while preserving tables
+    return smartClusterSections(rawItems, pageIndex);
   } catch (err) {
     console.error('Error extracting text items:', err);
     return [];
@@ -180,90 +170,296 @@ export async function extractTextItems(
 }
 
 /**
- * Smartly clusters individual text fragments and multi-line table cells
- * so that entire blocks are edited as a single coherent unit.
+ * Normalizes raw font name into a recognized CSS/Standard font family.
+ * Supports Adobe PDF Editor Pro typefaces, standard PostScript base 14 fonts,
+ * and high-fidelity platform fallbacks.
  */
-function smartClusterText(rawItems: DetectedTextItem[], pageIndex: number): DetectedTextItem[] {
+export function cleanFontFamily(rawName: string, fallback: string): string {
+  // Strip PDF 6-character subset prefix (e.g. ABCDEF+Calibri -> Calibri)
+  const clean = (rawName || '').replace(/^[A-Z]{6}\+/, '').trim();
+  const lower = `${clean} ${fallback}`.toLowerCase();
+
+  // Adobe Pro & standard typefaces
+  if (lower.includes('myriad')) return 'Myriad Pro';
+  if (lower.includes('minion')) return 'Minion Pro';
+  if (lower.includes('source sans') || lower.includes('sourcesans')) return 'Source Sans 3';
+  if (lower.includes('source serif') || lower.includes('sourceserif')) return 'Source Serif 4';
+  if (lower.includes('source code') || lower.includes('sourcecode')) return 'Source Code Pro';
+  if (lower.includes('palatino') || lower.includes('book antiqua')) return 'Palatino';
+  if (lower.includes('century gothic')) return 'Century Gothic';
+  if (lower.includes('futura')) return 'Futura';
+  if (lower.includes('baskerville')) return 'Baskerville';
+  if (lower.includes('caslon')) return 'Adobe Caslon Pro';
+  if (lower.includes('symbol')) return 'Symbol';
+  if (lower.includes('zapf') || lower.includes('dingbat') || lower.includes('wingding')) return 'ZapfDingbats';
+
+  if (lower.includes('calibri')) return 'Calibri';
+  if (lower.includes('arial')) return 'Arial';
+  if (lower.includes('times') || lower.includes('roman')) return 'Times New Roman';
+  if (lower.includes('segoe')) return 'Segoe UI';
+  if (lower.includes('roboto')) return 'Roboto';
+  if (lower.includes('georgia')) return 'Georgia';
+  if (lower.includes('garamond')) return 'Garamond';
+  if (lower.includes('cambria')) return 'Cambria';
+  if (lower.includes('verdana')) return 'Verdana';
+  if (lower.includes('tahoma')) return 'Tahoma';
+  if (lower.includes('trebuchet')) return 'Trebuchet MS';
+  if (lower.includes('courier')) return 'Courier New';
+  if (lower.includes('consolas')) return 'Consolas';
+  if (lower.includes('menlo')) return 'Menlo';
+  if (lower.includes('helvetica')) return 'Helvetica';
+
+  // Generic fallbacks (ensure 'sans' is checked before 'serif' to prevent sans-serif matching serif)
+  if (lower.includes('sans')) return 'Arial';
+  if (fallback === 'serif' || lower.includes('serif')) return 'Times New Roman';
+  if (fallback === 'monospace' || lower.includes('mono') || lower.includes('code')) return 'Courier New';
+
+  const stripped = clean
+    .replace(/-(Bold|Italic|Regular|Roman|Light|Medium|Black|SemiBold|Oblique|BoldItalic)$/i, '')
+    .replace(/(MT|PSMT|PS)$/i, '')
+    .trim();
+
+  return stripped || 'Arial';
+}
+
+/**
+ * Generates high-fidelity CSS font-family stack with Adobe Pro & platform fallbacks.
+ */
+export function getFontCss(family: string): string {
+  const f = (family || '').toLowerCase();
+
+  // Adobe Pro & specialty typefaces
+  if (f.includes('myriad')) return '"Myriad Pro", "Source Sans 3", "Segoe UI", Arial, sans-serif';
+  if (f.includes('minion')) return '"Minion Pro", "Source Serif 4", "Times New Roman", Times, Georgia, serif';
+  if (f.includes('source sans')) return '"Source Sans 3", "Source Sans Pro", "Segoe UI", Arial, sans-serif';
+  if (f.includes('source serif')) return '"Source Serif 4", "Source Serif Pro", "Times New Roman", serif';
+  if (f.includes('source code')) return '"Source Code Pro", Consolas, "Courier New", monospace';
+  if (f.includes('palatino') || f.includes('book antiqua')) return '"Palatino Linotype", "Book Antiqua", Palatino, serif';
+  if (f.includes('century gothic')) return '"Century Gothic", "Segoe UI", Arial, sans-serif';
+  if (f.includes('futura')) return 'Futura, "Trebuchet MS", Arial, sans-serif';
+  if (f.includes('baskerville')) return 'Baskerville, "Times New Roman", serif';
+  if (f.includes('caslon')) return '"Adobe Caslon Pro", "Big Caslon", Georgia, serif';
+  if (f.includes('symbol')) return 'Symbol, "Times New Roman", serif';
+  if (f.includes('zapf') || f.includes('dingbat') || f.includes('wingding')) return '"Zapf Dingbats", Wingdings, sans-serif';
+
+  // Standard typefaces
+  if (f.includes('calibri')) return 'Calibri, "Segoe UI", Arial, sans-serif';
+  if (f.includes('arial')) return 'Arial, Helvetica, sans-serif';
+  if (f.includes('times') || f.includes('roman')) return '"Times New Roman", Times, Georgia, serif';
+  if (f.includes('segoe')) return '"Segoe UI", Tahoma, Arial, sans-serif';
+  if (f.includes('roboto')) return 'Roboto, "Segoe UI", Arial, sans-serif';
+  if (f.includes('georgia')) return 'Georgia, "Times New Roman", serif';
+  if (f.includes('garamond')) return 'Garamond, "Times New Roman", serif';
+  if (f.includes('cambria')) return 'Cambria, Georgia, serif';
+  if (f.includes('verdana')) return 'Verdana, Geneva, sans-serif';
+  if (f.includes('tahoma')) return 'Tahoma, Arial, sans-serif';
+  if (f.includes('trebuchet')) return '"Trebuchet MS", Helvetica, sans-serif';
+  if (f.includes('courier')) return '"Courier New", Courier, monospace';
+  if (f.includes('consolas')) return 'Consolas, "Courier New", monospace';
+  if (f.includes('menlo')) return 'Menlo, Monaco, monospace';
+  if (f.includes('helvetica')) return 'Helvetica, Arial, sans-serif';
+
+  // Generic fallback: check 'sans' before 'serif'
+  if (f.includes('sans')) return 'Arial, Helvetica, sans-serif';
+  if (f.includes('serif')) return '"Times New Roman", Times, Georgia, serif';
+  if (f.includes('mono')) return '"Courier New", Courier, monospace';
+  return `"${family}", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif`;
+}
+
+/**
+ * Smartly clusters individual text fragments and multi-line sections so that
+ * paragraphs are edited as coherent units while preserving distinct table rows and columns.
+ */
+export function smartClusterSections(rawItems: DetectedTextItem[], pageIndex: number): DetectedTextItem[] {
   if (!rawItems || rawItems.length === 0) return [];
 
-  // Step 1: Sort by Y descending (top of page down), then X ascending (left to right)
-  const sorted = [...rawItems].sort((a, b) => b.y - a.y || a.x - b.x);
+  // Step 1: Group items into horizontal rows using vertical baseline tolerance
+  const sorted = [...rawItems].sort((a, b) => b.y - a.y);
+  const rows: { y: number; fontSize: number; items: DetectedTextItem[] }[] = [];
 
-  // Step 2: Merge words on the same horizontal line
-  const lineMerged: DetectedTextItem[] = [];
   for (const item of sorted) {
-    let merged = false;
-    for (const prev of lineMerged) {
-      const sameLine = Math.abs(prev.y - item.y) < Math.min(prev.fontSize, item.fontSize) * 0.45;
-      const isNextWord =
-        item.x >= prev.x + prev.width - 2 &&
-        item.x - (prev.x + prev.width) < prev.fontSize * 1.8;
-
-      if (sameLine && isNextWord) {
-        const needsSpace = item.x - (prev.x + prev.width) > prev.fontSize * 0.15;
-        prev.str += (needsSpace ? ' ' : '') + item.str;
-        prev.width = item.x + item.width - prev.x;
-        prev.height = Math.max(prev.height, item.height);
-        prev.isBold = prev.isBold || item.isBold;
-        prev.isItalic = prev.isItalic || item.isItalic;
-        if (item.fontFamily !== 'Helvetica') {
-          prev.fontFamily = item.fontFamily;
-        }
-        merged = true;
+    let placed = false;
+    for (const r of rows) {
+      if (Math.abs(r.y - item.y) <= Math.min(r.fontSize, item.fontSize) * 0.4) {
+        r.items.push(item);
+        placed = true;
         break;
       }
     }
-    if (!merged) {
-      lineMerged.push({ ...item });
+    if (!placed) {
+      rows.push({ y: item.y, fontSize: item.fontSize, items: [item] });
     }
   }
 
-  // Step 3: Merge vertically adjacent lines that belong to the same cell/paragraph
-  const clusters: DetectedTextItem[] = [];
-  for (const item of lineMerged) {
+  // Sort rows top-to-bottom
+  rows.sort((a, b) => b.y - a.y);
+
+  // Step 2: On each row, sort left-to-right, merge words, and detect multi-column table rows
+  interface RowData {
+    y: number;
+    isMultiColumn: boolean;
+    segments: (DetectedTextItem & { isTable?: boolean; origBoxes: { x: number; y: number; width: number; height: number }[] })[];
+  }
+
+  const rowLinesList: RowData[] = [];
+  for (const row of rows) {
+    row.items.sort((a, b) => a.x - b.x);
+    const lineSegments: RowData['segments'] = [];
+
+    for (const item of row.items) {
+      let merged = false;
+      for (const seg of lineSegments) {
+        const sameFont = Math.abs(seg.fontSize - item.fontSize) <= 1.5;
+        const gap = item.x - (seg.x + seg.width);
+        const isWordGap = gap >= -2 && gap <= Math.max(6, seg.fontSize * 0.85);
+
+        if (sameFont && isWordGap) {
+          const needsSpace = gap > 0.5 && !seg.str.endsWith(' ') && !item.str.startsWith(' ');
+          seg.str += (needsSpace ? ' ' : '') + item.str;
+          seg.width = item.x + item.width - seg.x;
+          seg.height = Math.max(seg.height, item.height);
+          seg.isBold = seg.isBold || item.isBold;
+          seg.isItalic = seg.isItalic || item.isItalic;
+          seg.origBoxes.push({ x: item.x, y: item.y, width: item.width, height: item.height });
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        lineSegments.push({
+          ...item,
+          origBoxes: [{ x: item.x, y: item.y, width: item.width, height: item.height }],
+        });
+      }
+    }
+
+    const isMultiColumn = lineSegments.length > 1;
+    // Calculate column separation and widths for table cells so text doesn't prematurely wrap
+    if (isMultiColumn) {
+      for (let i = 0; i < lineSegments.length; i++) {
+        const seg = lineSegments[i];
+        seg.isTable = true;
+        if (i < lineSegments.length - 1) {
+          const nextSeg = lineSegments[i + 1];
+          const availableColWidth = nextSeg.x - seg.x - 8;
+          seg.width = Math.max(seg.width, availableColWidth);
+        } else {
+          seg.width = Math.max(seg.width, 50);
+        }
+      }
+    }
+
+    rowLinesList.push({
+      y: row.y,
+      isMultiColumn,
+      segments: lineSegments,
+    });
+  }
+
+  // Step 3: Cluster paragraphs while preserving table cells and handling intra-cell line wraps
+  interface ClusterItem extends DetectedTextItem {
+    isTable?: boolean;
+    origYTop?: number;
+    origBoxes: { x: number; y: number; width: number; height: number }[];
+  }
+
+  const clusters: ClusterItem[] = [];
+  for (const rowData of rowLinesList) {
+    if (rowData.isMultiColumn) {
+      // Each cell in a multi-column table row is kept as an independent unit to preserve row layout & vertical alignment
+      for (const seg of rowData.segments) {
+        clusters.push({
+          ...seg,
+          origYTop: seg.y + seg.height,
+        });
+      }
+      continue;
+    }
+
+    // Single segment row: could be paragraph continuation or intra-cell wrap
+    const line = rowData.segments[0];
     let merged = false;
-    for (const cluster of clusters) {
-      const minX = Math.min(cluster.x, item.x);
-      const maxX = Math.max(cluster.x + cluster.width, item.x + item.width);
-      const xOverlap = Math.max(0, cluster.width + item.width - (maxX - minX));
-      const isXAligned =
-        Math.abs(cluster.x - item.x) < 25 ||
-        xOverlap > Math.min(cluster.width, item.width) * 0.35;
 
-      const verticalDist = cluster.y - item.y;
-      const isLineBelow = verticalDist > 0 && verticalDist < cluster.fontSize * 2.4;
-      const isSameFont = Math.abs(cluster.fontSize - item.fontSize) <= 3;
+    for (let cIdx = clusters.length - 1; cIdx >= 0; cIdx--) {
+      const cluster = clusters[cIdx];
+      const sameFont =
+        Math.abs(cluster.fontSize - line.fontSize) <= 1.5 &&
+        cluster.fontFamily === line.fontFamily;
+      if (!sameFont) continue;
 
-      if (isXAligned && isLineBelow && isSameFont) {
-        cluster.str += '\n' + item.str;
-        const newX = Math.min(cluster.x, item.x);
-        const newY = Math.min(cluster.y, item.y);
-        const newMaxX = Math.max(cluster.x + cluster.width, item.x + item.width);
-        const newMaxY = Math.max(cluster.y + cluster.height, item.y + item.height);
+      if (cluster.isTable) {
+        // Table cell wrap: only merge if strictly in the same column and directly below
+        const columnAligned = Math.abs(cluster.x - line.x) < 8;
+        const lineDirectlyBelow =
+          cluster.y - line.y > 0 &&
+          cluster.y - line.y <= cluster.fontSize * 1.8;
 
-        cluster.x = newX;
+        if (columnAligned && lineDirectlyBelow) {
+          cluster.str += '\n' + line.str;
+          cluster.y = line.y;
+          cluster.height = (cluster.origYTop || cluster.y + cluster.height) - line.y;
+          cluster.width = Math.max(cluster.width, line.width);
+          cluster.origBoxes.push(...line.origBoxes);
+          merged = true;
+          break;
+        }
+        continue;
+      }
+
+      // Paragraph / Section merging for standard body text
+      const verticalDist = cluster.y - line.y;
+      const isLineDirectlyBelow =
+        verticalDist > 0 && verticalDist <= cluster.fontSize * 2.2;
+
+      const leftAligned = Math.abs(cluster.x - line.x) <= Math.max(15, cluster.fontSize * 1.5);
+      const isIndented = line.x >= cluster.x && line.x <= cluster.x + 30;
+      const xOverlap = Math.max(
+        0,
+        Math.min(cluster.x + cluster.width, line.x + line.width) - Math.max(cluster.x, line.x)
+      );
+      const hasSignificantOverlap = xOverlap >= Math.min(cluster.width, line.width) * 0.5;
+
+      if (isLineDirectlyBelow && (leftAligned || isIndented || hasSignificantOverlap)) {
+        const topY = cluster.origYTop ?? (cluster.y + cluster.height);
+        const newY = line.y;
+        const minX = Math.min(cluster.x, line.x);
+        const maxX = Math.max(cluster.x + cluster.width, line.x + line.width);
+
+        cluster.str += '\n' + line.str;
+        cluster.x = minX;
         cluster.y = newY;
-        cluster.width = newMaxX - newX;
-        cluster.height = newMaxY - newY;
-        cluster.fontSize = Math.min(cluster.fontSize, item.fontSize);
-        cluster.isBold = cluster.isBold || item.isBold;
-        cluster.isItalic = cluster.isItalic || item.isItalic;
-        if (item.fontFamily !== 'Helvetica') {
-          cluster.fontFamily = item.fontFamily;
-        }
+        cluster.origYTop = topY;
+        cluster.width = maxX - minX;
+        cluster.height = topY - newY;
+        cluster.origBoxes.push(...line.origBoxes);
         merged = true;
         break;
       }
     }
+
     if (!merged) {
-      clusters.push({ ...item });
+      clusters.push({
+        ...line,
+        origYTop: line.y + line.height,
+        origBoxes: [...line.origBoxes],
+      });
     }
   }
 
-  // Assign stable IDs
   return clusters.map((c, idx) => ({
-    ...c,
     id: `text-${pageIndex}-${idx}`,
+    str: c.str,
+    x: c.x,
+    y: c.y,
+    width: c.width,
+    height: c.height,
+    origBoxes: c.origBoxes,
+    fontSize: c.fontSize,
+    fontName: c.fontName,
+    fontFamily: c.fontFamily,
+    isBold: c.isBold,
+    isItalic: c.isItalic,
+    transform: c.transform,
   }));
 }
 
@@ -346,8 +542,8 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     currentY -= 18;
   }
 
-  // Section 2 - Pricing
-  page1.drawText('2. Professional Fees & Payment Terms', {
+  // Section 2 - Pricing Table
+  page1.drawText('2. Professional Fees & Deliverables Breakdown', {
     x: 45,
     y: height - 315,
     size: 13,
@@ -355,25 +551,156 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     color: rgb(0.12, 0.16, 0.23),
   });
 
-  page1.drawText('Standard Consulting Rate: $175.00 per hour', {
+  // Table Header Background
+  page1.drawRectangle({
     x: 45,
-    y: height - 338,
-    size: 11,
-    font: fontBold,
-    color: rgb(0.15, 0.45, 0.25),
+    y: height - 346,
+    width: width - 90,
+    height: 22,
+    color: rgb(0.92, 0.94, 0.97),
   });
 
-  page1.drawText('Estimated Project Budget: $24,500.00 USD', {
-    x: 45,
-    y: height - 358,
-    size: 11,
+  page1.drawText('Deliverable / Item Description', {
+    x: 52,
+    y: height - 338,
+    size: 10,
+    font: fontBold,
+    color: rgb(0.15, 0.2, 0.3),
+  });
+
+  page1.drawText('Hours', {
+    x: 310,
+    y: height - 338,
+    size: 10,
+    font: fontBold,
+    color: rgb(0.15, 0.2, 0.3),
+  });
+
+  page1.drawText('Rate', {
+    x: 375,
+    y: height - 338,
+    size: 10,
+    font: fontBold,
+    color: rgb(0.15, 0.2, 0.3),
+  });
+
+  page1.drawText('Amount', {
+    x: 445,
+    y: height - 338,
+    size: 10,
+    font: fontBold,
+    color: rgb(0.15, 0.2, 0.3),
+  });
+
+  // Table Row 1
+  page1.drawText('Cloud Architecture & Infrastructure Review', {
+    x: 52,
+    y: height - 364,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('40', {
+    x: 310,
+    y: height - 364,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$175.00', {
+    x: 375,
+    y: height - 364,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$7,000.00', {
+    x: 445,
+    y: height - 364,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+
+  // Table Row 2
+  page1.drawText('Full-Stack Application Development', {
+    x: 52,
+    y: height - 384,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('80', {
+    x: 310,
+    y: height - 384,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$175.00', {
+    x: 375,
+    y: height - 384,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$14,000.00', {
+    x: 445,
+    y: height - 384,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+
+  // Table Row 3
+  page1.drawText('Security Audit & Compliance Hardening', {
+    x: 52,
+    y: height - 404,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('20', {
+    x: 310,
+    y: height - 404,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$175.00', {
+    x: 375,
+    y: height - 404,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  page1.drawText('$3,500.00', {
+    x: 445,
+    y: height - 404,
+    size: 10,
+    font: fontRegular,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+
+  // Total summary
+  page1.drawText('Total Estimated Budget:', {
+    x: 310,
+    y: height - 428,
+    size: 10,
+    font: fontBold,
+    color: rgb(0.12, 0.16, 0.23),
+  });
+  page1.drawText('$24,500.00 USD', {
+    x: 445,
+    y: height - 428,
+    size: 10,
     font: fontBold,
     color: rgb(0.15, 0.45, 0.25),
   });
 
   page1.drawText('Invoices will be submitted bi-weekly and payable within Net 30 days.', {
     x: 45,
-    y: height - 380,
+    y: height - 452,
     size: 10,
     font: fontRegular,
     color: rgb(0.3, 0.3, 0.3),
@@ -382,17 +709,17 @@ export async function createSamplePdf(): Promise<Uint8Array> {
   // Callout box
   page1.drawRectangle({
     x: 45,
-    y: height - 460,
+    y: height - 520,
     width: width - 90,
-    height: 55,
+    height: 48,
     color: rgb(0.95, 0.97, 1.0),
     borderColor: rgb(0.7, 0.8, 0.95),
     borderWidth: 1,
   });
 
-  page1.drawText('Tip: Click any text above to edit it in place directly!', {
+  page1.drawText('Tip: Click any cell or text in the table above to edit inline!', {
     x: 60,
-    y: height - 435,
+    y: height - 498,
     size: 11,
     font: fontBold,
     color: rgb(0.1, 0.3, 0.7),
@@ -401,7 +728,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
   // Signatures
   page1.drawText('Authorized Signature: ___________________________', {
     x: 45,
-    y: height - 540,
+    y: height - 580,
     size: 11,
     font: fontRegular,
     color: rgb(0.2, 0.2, 0.2),
@@ -409,7 +736,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
 
   page1.drawText('Date: _______________', {
     x: 400,
-    y: height - 540,
+    y: height - 580,
     size: 11,
     font: fontRegular,
     color: rgb(0.2, 0.2, 0.2),

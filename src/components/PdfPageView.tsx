@@ -8,14 +8,16 @@ import {
   CustomElement,
   DetectedTextItem
 } from '../types';
-import { renderPage, extractTextItems } from '../utils/pdfEngine';
+import { renderPage, extractTextItems, getFontCss } from '../utils/pdfEngine';
 import {
   Trash2,
   Check,
   Bold,
   Italic,
   Minus,
-  Plus
+  Plus,
+  Move,
+  GripHorizontal,
 } from 'lucide-react';
 
 interface PdfPageViewProps {
@@ -84,6 +86,14 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     startY: number;
     origWidth: number;
     origHeight: number;
+    origY: number;
+  } | null>(null);
+
+  // Moving / Repositioning text box
+  const [movingText, setMovingText] = useState<{
+    startX: number;
+    startY: number;
+    origX: number;
     origY: number;
   } | null>(null);
 
@@ -172,6 +182,26 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     const pdfX = clientX / zoom;
     const pdfY = (rect.height - clientY) / zoom;
 
+    // Handle Text Box Moving / Repositioning
+    if (movingText && activeTextEdit) {
+      const deltaX = (e.clientX - movingText.startX) / zoom;
+      const deltaY = (movingText.startY - e.clientY) / zoom; // PDF coordinates (up is positive)
+
+      const newX = Math.max(0, Math.round((movingText.origX + deltaX) * 10) / 10);
+      const newY = Math.max(0, Math.round((movingText.origY + deltaY) * 10) / 10);
+
+      setActiveTextEdit((prev) =>
+        prev
+          ? {
+              ...prev,
+              x: newX,
+              y: newY,
+            }
+          : null
+      );
+      return;
+    }
+
     // Handle Text Box Resizing
     if (resizingText && activeTextEdit) {
       const deltaX = (e.clientX - resizingText.startX) / zoom;
@@ -229,6 +259,10 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
   };
 
   const handleMouseUp = () => {
+    if (movingText) {
+      setMovingText(null);
+    }
+
     if (resizingText) {
       setResizingText(null);
     }
@@ -270,7 +304,14 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
     setEditingTextId(item.id);
 
     if (existingEdit) {
-      setActiveTextEdit({ ...existingEdit });
+      setActiveTextEdit({
+        ...existingEdit,
+        origX: existingEdit.origX ?? item.x,
+        origY: existingEdit.origY ?? item.y,
+        origWidth: existingEdit.origWidth ?? item.width,
+        origHeight: existingEdit.origHeight ?? item.height,
+        origBoxes: existingEdit.origBoxes ?? item.origBoxes,
+      });
     } else {
       setActiveTextEdit({
         id: `edit-${item.id}`,
@@ -281,6 +322,11 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
         y: item.y,
         width: item.width,
         height: item.height,
+        origX: item.x,
+        origY: item.y,
+        origWidth: item.width,
+        origHeight: item.height,
+        origBoxes: item.origBoxes,
         fontSize: item.fontSize,
         fontFamily: item.fontFamily,
         isBold: item.isBold,
@@ -294,13 +340,18 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
   const commitActiveTextEdit = () => {
     if (!activeTextEdit) return;
 
-    if (
+    const hasChanged =
       activeTextEdit.newText !== activeTextEdit.originalText ||
       activeTextEdit.isDeleted ||
       activeTextEdit.isBold ||
       activeTextEdit.isItalic ||
-      activeTextEdit.fontSize
-    ) {
+      activeTextEdit.fontSize !== activeTextEdit.fontSize ||
+      activeTextEdit.x !== (activeTextEdit.origX ?? activeTextEdit.x) ||
+      activeTextEdit.y !== (activeTextEdit.origY ?? activeTextEdit.y) ||
+      activeTextEdit.width !== (activeTextEdit.origWidth ?? activeTextEdit.width) ||
+      activeTextEdit.height !== (activeTextEdit.origHeight ?? activeTextEdit.height);
+
+    if (hasChanged) {
       onRecordHistory();
       onUpdateTextEdit(activeTextEdit);
     }
@@ -346,11 +397,26 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
           (t) => t.pageId === page.id && t.id === `edit-${item.id}`
         );
 
-        const currentEdit = editingTextId === item.id ? activeTextEdit : existingEdit;
         const isEditing = editingTextId === item.id;
+        const currentEdit = isEditing ? activeTextEdit : existingEdit;
         const isDeleted = currentEdit?.isDeleted;
 
-        // Current coordinates (uses edited box dimensions if adjusted)
+        // Has this item been modified in any way (edited text, deleted, moved, resized, or restyled)?
+        const isModified =
+          isEditing ||
+          (existingEdit !== undefined &&
+            (existingEdit.newText !== item.str ||
+              existingEdit.fontSize !== item.fontSize ||
+              existingEdit.width !== item.width ||
+              existingEdit.height !== item.height ||
+              existingEdit.x !== item.x ||
+              existingEdit.y !== item.y ||
+              existingEdit.fontFamily !== item.fontFamily ||
+              existingEdit.isBold !== item.isBold ||
+              existingEdit.isItalic !== item.isItalic ||
+              existingEdit.isDeleted));
+
+        // Current coordinates (uses edited box dimensions and position)
         const curX = currentEdit ? currentEdit.x : item.x;
         const curY = currentEdit ? currentEdit.y : item.y;
         const curW = currentEdit ? currentEdit.width : item.width;
@@ -361,270 +427,348 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
         const width = (curW / page.width) * 100;
         const height = (curH / page.height) * 100;
 
+        // Array of original bounding boxes (for sections with multi-lines) to permanently whiteout on canvas
+        const maskBoxes =
+          item.origBoxes && item.origBoxes.length > 0
+            ? item.origBoxes
+            : [{ x: item.x, y: item.y, width: item.width, height: item.height }];
+
+        // Render whiteout mask over all original text locations whenever modified/editing
+        const originalMaskElements = isModified ? (
+          maskBoxes.map((box, bIdx) => {
+            const bLeft = ((box.x - 1) / page.width) * 100;
+            const bTop = ((page.height - box.y - box.height - 1) / page.height) * 100;
+            const bWidth = ((box.width + 2) / page.width) * 100;
+            const bHeight = ((box.height + 2) / page.height) * 100;
+            return (
+              <div
+                key={`orig-mask-${item.id}-${bIdx}`}
+                className="absolute bg-white pointer-events-none z-10"
+                style={{
+                  left: `${bLeft}%`,
+                  top: `${bTop}%`,
+                  width: `${bWidth}%`,
+                  height: `${bHeight}%`,
+                }}
+              />
+            );
+          })
+        ) : null;
+
         if (isDeleted) {
           return (
-            <div
-              key={item.id}
-              className="absolute bg-white z-10 border border-transparent hover:border-red-300"
-              style={{
-                left: `${left}%`,
-                top: `${top}%`,
-                width: `${width}%`,
-                height: `${height}%`,
-              }}
-              title="Deleted / Whiteout text area"
-            />
+            <React.Fragment key={item.id}>
+              {originalMaskElements}
+              <div
+                className="absolute bg-white z-10 border border-transparent hover:border-red-300"
+                style={{
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                }}
+                title="Deleted / Whiteout text area"
+              />
+            </React.Fragment>
           );
         }
 
-        // Active inline editing with floating toolbar & resize handles
+        // Active inline editing with floating toolbar, move handle, & resize handles
         if (isEditing && activeTextEdit) {
-          const fontCss =
-            activeTextEdit.fontFamily === 'Times'
-              ? '"Times New Roman", Times, Georgia, serif'
-              : activeTextEdit.fontFamily === 'Courier'
-              ? '"Courier New", Courier, monospace'
-              : 'Helvetica, Arial, sans-serif';
+          const fontCss = getFontCss(activeTextEdit.fontFamily);
 
           return (
-            <div
-              key={item.id}
-              className="absolute z-30 flex flex-col items-start bg-white shadow-xl ring-2 ring-indigo-500 rounded-sm"
-              style={{
-                left: `${left}%`,
-                top: `${top}%`,
-                width: `${width}%`,
-                minHeight: `${height}%`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              {/* Floating Toolbar above the text box */}
+            <React.Fragment key={item.id}>
+              {originalMaskElements}
               <div
-                className="absolute -top-10 left-0 flex items-center space-x-1 bg-slate-900 text-white px-2 py-1 rounded-lg shadow-xl text-xs z-40 whitespace-nowrap"
-                onMouseDown={(e) => e.stopPropagation()}
-              >
-                {/* Font Family selector */}
-                <select
-                  value={activeTextEdit.fontFamily}
-                  onChange={(e) =>
-                    setActiveTextEdit({ ...activeTextEdit, fontFamily: e.target.value })
-                  }
-                  className="bg-slate-800 text-slate-100 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] focus:outline-none"
-                >
-                  <option value="Helvetica">Sans (Helvetica)</option>
-                  <option value="Times">Serif (Times)</option>
-                  <option value="Courier">Mono (Courier)</option>
-                </select>
-
-                <div className="h-3.5 w-[1px] bg-slate-700" />
-
-                {/* Font Size decrease */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setActiveTextEdit({
-                      ...activeTextEdit,
-                      fontSize: Math.max(6, activeTextEdit.fontSize - 1),
-                    })
-                  }
-                  className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
-                  title="Decrease Font Size"
-                >
-                  <Minus className="w-3 h-3" />
-                </button>
-
-                <span className="font-mono text-[11px] px-1 text-slate-200">
-                  {activeTextEdit.fontSize}pt
-                </span>
-
-                {/* Font Size increase */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setActiveTextEdit({
-                      ...activeTextEdit,
-                      fontSize: Math.min(72, activeTextEdit.fontSize + 1),
-                    })
-                  }
-                  className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
-                  title="Increase Font Size"
-                >
-                  <Plus className="w-3 h-3" />
-                </button>
-
-                <div className="h-3.5 w-[1px] bg-slate-700" />
-
-                {/* Bold toggle */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setActiveTextEdit({ ...activeTextEdit, isBold: !activeTextEdit.isBold })
-                  }
-                  className={`p-1 rounded ${
-                    activeTextEdit.isBold
-                      ? 'bg-indigo-600 text-white font-bold'
-                      : 'hover:bg-slate-800 text-slate-300'
-                  }`}
-                  title="Toggle Bold"
-                >
-                  <Bold className="w-3 h-3" />
-                </button>
-
-                {/* Italic toggle */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setActiveTextEdit({ ...activeTextEdit, isItalic: !activeTextEdit.isItalic })
-                  }
-                  className={`p-1 rounded ${
-                    activeTextEdit.isItalic
-                      ? 'bg-indigo-600 text-white'
-                      : 'hover:bg-slate-800 text-slate-300'
-                  }`}
-                  title="Toggle Italic"
-                >
-                  <Italic className="w-3 h-3" />
-                </button>
-
-                <div className="h-3.5 w-[1px] bg-slate-700" />
-
-                {/* Delete / Whiteout */}
-                <button
-                  type="button"
-                  onClick={handleDeleteText}
-                  className="p-1 hover:bg-red-600 text-red-400 hover:text-white rounded transition-colors"
-                  title="Delete Text & Mask Whiteout"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-
-                {/* Save / Done button */}
-                <button
-                  type="button"
-                  onClick={commitActiveTextEdit}
-                  className="p-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded transition-colors"
-                  title="Save Edit"
-                >
-                  <Check className="w-3 h-3" />
-                </button>
-              </div>
-
-              {/* Multi-line Text Area wrapping inside the box */}
-              <textarea
-                autoFocus
-                value={activeTextEdit.newText}
-                onChange={(e) =>
-                  setActiveTextEdit({ ...activeTextEdit, newText: e.target.value })
-                }
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') {
-                    setEditingTextId(null);
-                    setActiveTextEdit(null);
-                  }
-                }}
-                className="w-full h-full bg-white text-slate-900 border-none outline-none p-0.5 resize-none overflow-hidden"
+                className="absolute z-30 flex flex-col items-start bg-white shadow-xl ring-2 ring-indigo-500 rounded-xs"
                 style={{
-                  fontSize: `${activeTextEdit.fontSize * zoom}px`,
-                  fontFamily: fontCss,
-                  fontWeight: activeTextEdit.isBold ? 'bold' : 'normal',
-                  fontStyle: activeTextEdit.isItalic ? 'italic' : 'normal',
-                  lineHeight: 1.25,
-                  wordBreak: 'break-word',
-                  whiteSpace: 'pre-wrap',
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  minHeight: `${height}%`,
                 }}
-              />
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Floating Toolbar above the text box */}
+                <div
+                  className="absolute -top-10 left-0 flex items-center space-x-1 bg-slate-900 text-white px-2 py-1 rounded-lg shadow-xl text-xs z-40 whitespace-nowrap"
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  {/* Move / Drag Button */}
+                  <div
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      setMovingText({
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        origX: activeTextEdit.x,
+                        origY: activeTextEdit.y,
+                      });
+                    }}
+                    className="flex items-center px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 cursor-move rounded text-slate-200 hover:text-white transition-colors"
+                    title="Drag to reposition text box anywhere on page"
+                  >
+                    <Move className="w-3 h-3 mr-1 text-indigo-400" />
+                    <span className="text-[11px] font-medium">Move</span>
+                  </div>
 
-              {/* Resize Handle: Right (Width) */}
-              <div
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  setResizingText({
-                    handle: 'right',
-                    startX: e.clientX,
-                    startY: e.clientY,
-                    origWidth: activeTextEdit.width,
-                    origHeight: activeTextEdit.height,
-                    origY: activeTextEdit.y,
-                  });
-                }}
-                className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-3 h-5 bg-indigo-600 border border-white rounded-xs cursor-ew-resize shadow-xs"
-                title="Drag to resize box width"
-              />
+                  <div className="h-3.5 w-[1px] bg-slate-700" />
 
-              {/* Resize Handle: Bottom (Height) */}
-              <div
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  setResizingText({
-                    handle: 'bottom',
-                    startX: e.clientX,
-                    startY: e.clientY,
-                    origWidth: activeTextEdit.width,
-                    origHeight: activeTextEdit.height,
-                    origY: activeTextEdit.y,
-                  });
-                }}
-                className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 h-3 w-5 bg-indigo-600 border border-white rounded-xs cursor-ns-resize shadow-xs"
-                title="Drag to resize box height"
-              />
+                  {/* Font Family selector */}
+                  <select
+                    value={activeTextEdit.fontFamily}
+                    onChange={(e) =>
+                      setActiveTextEdit({ ...activeTextEdit, fontFamily: e.target.value })
+                    }
+                    className="bg-slate-800 text-slate-100 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] focus:outline-none"
+                  >
+                    {!['Calibri', 'Arial', 'Times New Roman', 'Segoe UI', 'Roboto', 'Georgia', 'Garamond', 'Cambria', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Courier New', 'Consolas', 'Helvetica', 'Myriad Pro', 'Minion Pro', 'Palatino'].includes(activeTextEdit.fontFamily) && (
+                      <option value={activeTextEdit.fontFamily}>{activeTextEdit.fontFamily} (Detected)</option>
+                    )}
+                    <option value="Calibri">Calibri (Sans)</option>
+                    <option value="Arial">Arial (Sans)</option>
+                    <option value="Helvetica">Helvetica (Sans)</option>
+                    <option value="Myriad Pro">Myriad Pro (Adobe Sans)</option>
+                    <option value="Times New Roman">Times New Roman (Serif)</option>
+                    <option value="Minion Pro">Minion Pro (Adobe Serif)</option>
+                    <option value="Georgia">Georgia (Serif)</option>
+                    <option value="Garamond">Garamond (Serif)</option>
+                    <option value="Cambria">Cambria (Serif)</option>
+                    <option value="Palatino">Palatino (Serif)</option>
+                    <option value="Segoe UI">Segoe UI (Sans)</option>
+                    <option value="Roboto">Roboto (Sans)</option>
+                    <option value="Verdana">Verdana (Sans)</option>
+                    <option value="Tahoma">Tahoma (Sans)</option>
+                    <option value="Trebuchet MS">Trebuchet MS (Sans)</option>
+                    <option value="Courier New">Courier New (Mono)</option>
+                    <option value="Consolas">Consolas (Mono)</option>
+                  </select>
 
-              {/* Resize Handle: Bottom-Right Corner (Width & Height) */}
-              <div
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  setResizingText({
-                    handle: 'corner',
-                    startX: e.clientX,
-                    startY: e.clientY,
-                    origWidth: activeTextEdit.width,
-                    origHeight: activeTextEdit.height,
-                    origY: activeTextEdit.y,
-                  });
-                }}
-                className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 bg-indigo-600 border border-white rounded-xs cursor-nwse-resize shadow-xs"
-                title="Drag corner to resize box"
-              />
-            </div>
+                  <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                  {/* Font Size decrease */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveTextEdit({
+                        ...activeTextEdit,
+                        fontSize: Math.max(6, activeTextEdit.fontSize - 1),
+                      })
+                    }
+                    className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
+                    title="Decrease Font Size"
+                  >
+                    <Minus className="w-3 h-3" />
+                  </button>
+
+                  <span className="font-mono text-[11px] px-1 text-slate-200">
+                    {activeTextEdit.fontSize}pt
+                  </span>
+
+                  {/* Font Size increase */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveTextEdit({
+                        ...activeTextEdit,
+                        fontSize: Math.min(72, activeTextEdit.fontSize + 1),
+                      })
+                    }
+                    className="p-1 hover:bg-slate-800 rounded text-slate-300 hover:text-white"
+                    title="Increase Font Size"
+                  >
+                    <Plus className="w-3 h-3" />
+                  </button>
+
+                  <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                  {/* Bold toggle */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveTextEdit({ ...activeTextEdit, isBold: !activeTextEdit.isBold })
+                    }
+                    className={`p-1 rounded ${
+                      activeTextEdit.isBold
+                        ? 'bg-indigo-600 text-white font-bold'
+                        : 'hover:bg-slate-800 text-slate-300'
+                    }`}
+                    title="Toggle Bold"
+                  >
+                    <Bold className="w-3 h-3" />
+                  </button>
+
+                  {/* Italic toggle */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveTextEdit({ ...activeTextEdit, isItalic: !activeTextEdit.isItalic })
+                    }
+                    className={`p-1 rounded ${
+                      activeTextEdit.isItalic
+                        ? 'bg-indigo-600 text-white'
+                        : 'hover:bg-slate-800 text-slate-300'
+                    }`}
+                    title="Toggle Italic"
+                  >
+                    <Italic className="w-3 h-3" />
+                  </button>
+
+                  <div className="h-3.5 w-[1px] bg-slate-700" />
+
+                  {/* Delete / Whiteout */}
+                  <button
+                    type="button"
+                    onClick={handleDeleteText}
+                    className="p-1 hover:bg-red-600 text-red-400 hover:text-white rounded transition-colors"
+                    title="Delete Text & Mask Whiteout"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+
+                  {/* Save / Done button */}
+                  <button
+                    type="button"
+                    onClick={commitActiveTextEdit}
+                    className="p-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded transition-colors"
+                    title="Save Edit"
+                  >
+                    <Check className="w-3 h-3" />
+                  </button>
+                </div>
+
+                {/* Top Drag Grip Bar - placed above text box so text baseline perfectly preserves vertical alignment */}
+                <div
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    setMovingText({
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origX: activeTextEdit.x,
+                      origY: activeTextEdit.y,
+                    });
+                  }}
+                  className="absolute -top-3.5 left-0 w-full h-3.5 bg-indigo-50 hover:bg-indigo-100 cursor-move border border-indigo-300 border-b-0 rounded-t-xs flex items-center justify-center select-none"
+                  title="Drag to reposition text box"
+                >
+                  <GripHorizontal className="w-4 h-2 text-indigo-400" />
+                </div>
+
+                {/* Multi-line Text Area wrapping inside the box */}
+                <textarea
+                  autoFocus
+                  value={activeTextEdit.newText}
+                  onChange={(e) =>
+                    setActiveTextEdit({ ...activeTextEdit, newText: e.target.value })
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      setEditingTextId(null);
+                      setActiveTextEdit(null);
+                    }
+                  }}
+                  className="w-full h-full bg-white text-slate-900 border-none outline-none px-0.5 py-0 resize-none overflow-hidden"
+                  style={{
+                    fontSize: `${activeTextEdit.fontSize * zoom}px`,
+                    fontFamily: fontCss,
+                    fontWeight: activeTextEdit.isBold ? 'bold' : 'normal',
+                    fontStyle: activeTextEdit.isItalic ? 'italic' : 'normal',
+                    lineHeight: 1.25,
+                    wordBreak: 'break-word',
+                    whiteSpace: 'pre-wrap',
+                  }}
+                />
+
+                {/* Resize Handle: Right (Width) */}
+                <div
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    setResizingText({
+                      handle: 'right',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origWidth: activeTextEdit.width,
+                      origHeight: activeTextEdit.height,
+                      origY: activeTextEdit.y,
+                    });
+                  }}
+                  className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-3 h-5 bg-indigo-600 border border-white rounded-xs cursor-ew-resize shadow-xs"
+                  title="Drag to resize box width"
+                />
+
+                {/* Resize Handle: Bottom (Height) */}
+                <div
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    setResizingText({
+                      handle: 'bottom',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origWidth: activeTextEdit.width,
+                      origHeight: activeTextEdit.height,
+                      origY: activeTextEdit.y,
+                    });
+                  }}
+                  className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 h-3 w-5 bg-indigo-600 border border-white rounded-xs cursor-ns-resize shadow-xs"
+                  title="Drag to resize box height"
+                />
+
+                {/* Resize Handle: Bottom-Right Corner (Width & Height) */}
+                <div
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    setResizingText({
+                      handle: 'corner',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origWidth: activeTextEdit.width,
+                      origHeight: activeTextEdit.height,
+                      origY: activeTextEdit.y,
+                    });
+                  }}
+                  className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 bg-indigo-600 border border-white rounded-xs cursor-nwse-resize shadow-xs"
+                  title="Drag corner to resize box"
+                />
+              </div>
+            </React.Fragment>
           );
         }
 
         // If previously edited, mask original on canvas and render updated text wrapped in box
-        if (existingEdit && (existingEdit.newText !== item.str || existingEdit.fontSize !== item.fontSize || existingEdit.width !== item.width)) {
-          const fontCss =
-            existingEdit.fontFamily === 'Times'
-              ? '"Times New Roman", Times, Georgia, serif'
-              : existingEdit.fontFamily === 'Courier'
-              ? '"Courier New", Courier, monospace'
-              : 'Helvetica, Arial, sans-serif';
+        if (existingEdit && isModified) {
+          const fontCss = getFontCss(existingEdit.fontFamily);
 
           return (
-            <div
-              key={item.id}
-              onClick={() => activeTool === 'editText' && handleStartEditText(item, existingEdit)}
-              className={`absolute z-10 bg-white flex flex-col justify-start cursor-pointer transition-all ${
-                activeTool === 'editText'
-                  ? 'hover:ring-1 hover:ring-indigo-400 hover:bg-indigo-50/20'
-                  : ''
-              }`}
-              style={{
-                left: `${left}%`,
-                top: `${top}%`,
-                width: `${width}%`,
-                height: `${height}%`,
-                fontSize: `${existingEdit.fontSize * zoom}px`,
-                fontFamily: fontCss,
-                fontWeight: existingEdit.isBold ? 'bold' : 'normal',
-                fontStyle: existingEdit.isItalic ? 'italic' : 'normal',
-                color: '#1a1a1a',
-                lineHeight: 1.25,
-                overflow: 'hidden',
-                wordBreak: 'break-word',
-                whiteSpace: 'pre-wrap',
-              }}
-              title="Click to edit or adjust box size"
-            >
-              {existingEdit.newText}
-            </div>
+            <React.Fragment key={item.id}>
+              {originalMaskElements}
+              <div
+                onClick={() => activeTool === 'editText' && handleStartEditText(item, existingEdit)}
+                className={`absolute z-20 bg-white flex flex-col justify-start px-0.5 py-0 cursor-pointer transition-all ${
+                  activeTool === 'editText'
+                    ? 'hover:ring-1 hover:ring-indigo-400 hover:bg-indigo-50/20'
+                    : ''
+                }`}
+                style={{
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                  fontSize: `${existingEdit.fontSize * zoom}px`,
+                  fontFamily: fontCss,
+                  fontWeight: existingEdit.isBold ? 'bold' : 'normal',
+                  fontStyle: existingEdit.isItalic ? 'italic' : 'normal',
+                  color: '#1a1a1a',
+                  lineHeight: 1.25,
+                  overflow: 'hidden',
+                  wordBreak: 'break-word',
+                  whiteSpace: 'pre-wrap',
+                }}
+                title="Click to edit, resize, or reposition text box"
+              >
+                {existingEdit.newText}
+              </div>
+            </React.Fragment>
           );
         }
 
@@ -644,7 +788,7 @@ export const PdfPageView: React.FC<PdfPageViewProps> = ({
               width: `${width}%`,
               height: `${height}%`,
             }}
-            title={activeTool === 'editText' ? `Click to edit: "${item.str}"` : undefined}
+            title={activeTool === 'editText' ? `Click to edit: "${item.str.length > 40 ? item.str.substring(0, 40) + '...' : item.str}"` : undefined}
           />
         );
       })}

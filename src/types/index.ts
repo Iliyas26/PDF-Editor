@@ -17,6 +17,11 @@ export interface TextEditItem {
   y: number; // PDF points from bottom (PDF coords)
   width: number; // PDF points
   height: number; // PDF points
+  origX?: number; // original PDF points from left (persisted even when moved)
+  origY?: number; // original PDF points from bottom (persisted even when moved)
+  origWidth?: number; // original PDF points width
+  origHeight?: number; // original PDF points height
+  origBoxes?: { x: number; y: number; width: number; height: number }[]; // original lines/fragments in this section
   fontSize: number;
   fontFamily: string;
   isBold?: boolean;
@@ -66,6 +71,7 @@ export interface DetectedTextItem {
   y: number; // PDF points
   width: number;
   height: number;
+  origBoxes?: { x: number; y: number; width: number; height: number }[];
   fontSize: number;
   fontName: string;
   fontFamily: string;
