@@ -13,6 +13,8 @@ dist-ssr
 *.local
 .agent
 .kiro
+/AGENTS.md
+/.agents/
 
 # Editor directories and files
 .vscode/*
